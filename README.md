@@ -1219,6 +1219,170 @@ curl -s http://localhost:8000/sdk/rollout-plan \
   -d '{"target_digest":"new","max_parallel":2,"max_unavailable_weight":50,"region_max_unavailable_weight":{"r1":50},"nodes":[{"id":"a","current_digest":"old","region":"r1","failure_domain":"fd-a","traffic_weight":20},{"id":"b","current_digest":"old","region":"r1","failure_domain":"fd-b","traffic_weight":20}]}'
 ```
 
+### `POST /sdk/rollout-audit` — SDK 分波铺开执行审计
+
+在 [分波铺开规划](#post-sdkrollout-plan--配置制品分波铺开规划)产出
+`status=planned` 的原计划后，审计 SDK 节点实际上报的执行事件流：事件按
+`sequence` 序贯折叠重放，每波护栏彼此独立地复用
+[序贯护栏（Wald SPRT）](#post-guardrailsevaluate--序贯护栏评估)累计判定，
+**遇到首个违规即停止**。
+
+请求体：
+
+```json
+{
+  "plan": {
+    "target_digest": "new",
+    "status": "planned",
+    "up_to_date_nodes": ["node-c"],
+    "planned_node_count": 2,
+    "waves": [
+      {"wave": 1, "node_ids": ["node-a"], "global_unavailable_weight": 30, "region_unavailable_weight": {"cn-east": 30}, "completed_node_ids": ["node-a", "node-c"], "completed_node_count": 2},
+      {"wave": 2, "node_ids": ["node-b"], "global_unavailable_weight": 30, "region_unavailable_weight": {"cn-east": 30}, "completed_node_ids": ["node-a", "node-b", "node-c"], "completed_node_count": 3}
+    ],
+    "blockers": []
+  },
+  "guardrails": [
+    {"id": "error_rate", "baseline_rate": 0.01, "max_increase": 0.01, "alpha": 0.05, "beta": 0.1}
+  ],
+  "events": [
+    {"event_id": "e1", "sequence": 1, "type": "wave_started", "wave": 1},
+    {"event_id": "e2", "sequence": 2, "type": "node_completed", "wave": 1, "node_id": "node-a"},
+    {"event_id": "e3", "sequence": 3, "type": "metric_batch", "wave": 1, "metric_id": "error_rate", "batch": 1, "failures": 0, "total": 100}
+  ]
+}
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `plan` | `/sdk/rollout-plan` 返回的**原计划**，必须 `status=planned`（`blocked` 拒绝，`422`） |
+| `guardrails` | 1～8 个护栏指标声明，字段同 `/guardrails/evaluate` 的指标（`id` 唯一），**不含批次**；每波从空批次独立累计 |
+| `events` | 执行事件，可乱序提交；每条带唯一 `event_id` 与 `sequence`（≥0） |
+
+三种事件类型（类型无关字段必须缺省，否则 `422`）：
+
+| `type` | 必填字段 | 含义 |
+| --- | --- | --- |
+| `wave_started` | `wave` | 启动指定波次 |
+| `node_completed` | `wave`、`node_id` | 该波内一个节点完成更新 |
+| `metric_batch` | `wave`、`metric_id`、`batch`、`failures`、`total` | 该波一个指标的增量观测批次；`batch` 为该波该指标 1 起始的批次号，`0 ≤ failures ≤ total` |
+
+折叠与序贯护栏：
+
+- 事件先按 `event_id` **去重**（同 ID 内容完全一致只计一次，内容冲突 →
+  `422`），再按 `sequence` 升序重放（`sequence` 重复 → `422`）；
+- `wave_started` 必须严格按波次顺序：**`promote` 后方可启动下一波**——
+  前一波未启动（越波）或护栏仍为 `hold` 时启动下一波均为 `wave_skipped`；
+  重复启动已启动波为 `wave_already_started`；
+- 节点**只能在所属波启动后完成**（`node_before_wave_start`），同一节点重复
+  完成为 `node_already_completed`；
+- **每波全部节点完成后才可接收指标**：波未启动收指标为
+  `metrics_before_wave_start`，仍有节点未完成收指标为
+  `metrics_before_nodes_complete`；
+- 每波每指标的 `batch` 必须从 1 起**连续递增**（重复/跳号为
+  `metric_batch_gap`）；指标首次越过 SPRT 阈值即冻结（同
+  `/guardrails/evaluate` 语义），冻结后再到批次为 `metric_frozen`；
+- 各波护栏累计**彼此独立**：波总决策为该波全部指标的汇总（任一 rollback →
+  `rollback`、全部 pass → `promote`、其余 → `hold`）；某波一旦判定
+  `rollback`，其后**任何事件**（同波后续批次、节点事件或越波启动）均为
+  `event_after_rollback`（`rollback` 后再执行均违规）；
+- **遇到首个违规即停止**：违规事件不改变状态，响应给出该事件及处理前的
+  **事前状态**（`state.replayed_event_count` 为已成功折叠的事件数）。
+
+响应（`200`）——合法日志 `valid=true`，`state.status` 为
+`running` / `completed` / `rollback_required`：
+
+```json
+{
+  "valid": true,
+  "violation": null,
+  "state": {
+    "status": "running",
+    "current_wave": 1,
+    "all_completed_node_ids": ["node-a", "node-c"],
+    "replayed_event_count": 3,
+    "waves": [
+      {
+        "wave": 1,
+        "status": "awaiting_metrics",
+        "started": true,
+        "completed_node_ids": ["node-a"],
+        "batch_count": 1,
+        "decision": "hold",
+        "metrics": [
+          {
+            "id": "error_rate",
+            "decision": "hold",
+            "stop_batch": null,
+            "failures": 0,
+            "total": 100,
+            "p0": 0.01,
+            "p1": 0.02,
+            "lower_threshold": -2.25129,
+            "upper_threshold": 2.89037,
+            "llr": -1.01523,
+            "path": [{"batch": 1, "failures": 0, "total": 100, "llr": -1.01523}]
+          }
+        ]
+      },
+      {"wave": 2, "status": "pending", "started": false, "completed_node_ids": [], "batch_count": 0, "decision": null, "metrics": []}
+    ]
+  }
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `state.status` | `running`（尚未全部 promote）/ `completed`（全部波 promote 且节点完成）/ `rollback_required`（任一波护栏 rollback） |
+| `state.current_wave` | 最近已启动的波次号；一波未启动时为 `null` |
+| `state.all_completed_node_ids` | 各波已完成节点并集 + 原计划 `up_to_date_nodes`（ID 升序） |
+| `state.replayed_event_count` | 成功折叠（去重后、违规前）的事件数 |
+| `waves[].status` | `pending` / `running`（已启动未完成节点）/ `awaiting_metrics`（节点全完成、护栏未终判）/ `promoted` / `rollback_required` |
+| `waves[].completed_node_ids` | **本波**已完成的节点（ID 升序） |
+| `waves[].decision` | 本波护栏总决策 `promote` / `hold` / `rollback`；未收任何批次时为 `null` |
+| `waves[].metrics[]` | 启动后各指标的独立累计结果，结构同 `/guardrails/evaluate` 的 `metrics[]`（`path` 为逐批 LLR 路径，越界后冻结）；`pending` 波为空 |
+
+违规响应（仍为 `200`，便于审计工具读取）`valid=false`，`violation` 给出
+`kind`、中文 `message` 与原始 `event`，`state` 为**事前状态**：
+
+```json
+{
+  "valid": false,
+  "violation": {
+    "kind": "wave_skipped",
+    "message": "第 1 波护栏尚未 promote（当前判定：hold），不允许启动第 2 波（event_id=e9）",
+    "event": {"event_id": "e9", "sequence": 9, "type": "wave_started", "wave": 2}
+  },
+  "state": { "...": "处理 e9 之前的状态快照" }
+}
+```
+
+`violation.kind` 取值：`wave_skipped`、`wave_already_started`、
+`node_before_wave_start`、`node_already_completed`、
+`metrics_before_wave_start`、`metrics_before_nodes_complete`、
+`metric_batch_gap`、`metric_frozen`、`event_after_rollback`。
+
+请求校验（不满足时返回 `422`）：
+
+| 规则 | 说明 |
+| --- | --- |
+| 原计划 | 必须 `status=planned` 且 `blockers` 为空；波次号从 1 连续、节点不跨波重复、`planned_node_count` 与各波节点总数一致 |
+| 护栏 | 1～8 个，`id` 唯一；比率与 α/β 约束同 `/guardrails/evaluate` |
+| 事件引用 | `wave` 必须在计划范围内；`node_id` 必须属于该波（已达目标节点不在任何波）；`metric_id` 必须已声明 |
+| 事件形状 | 三类事件只允许携带各自的必填字段；`failures ≤ total` |
+| 折叠 | 同一 `event_id` 内容冲突（含 `sequence`、类型或任一字段不同）；去重后 `sequence` 重复 |
+| 额外字段 | 请求与事件对象均拒绝未声明字段 |
+
+请求示例：
+
+```bash
+curl -s http://localhost:8000/sdk/rollout-audit \
+  -H 'Content-Type: application/json' \
+  -d '{"plan":{"target_digest":"new","status":"planned","up_to_date_nodes":[],"planned_node_count":1,"waves":[{"wave":1,"node_ids":["a"],"global_unavailable_weight":1,"region_unavailable_weight":{"r1":1},"completed_node_ids":["a"],"completed_node_count":1}],"blockers":[]},"guardrails":[{"id":"m","baseline_rate":0.01,"max_increase":0.01,"alpha":0.05,"beta":0.1}],"events":[{"event_id":"s1","sequence":1,"type":"wave_started","wave":1},{"event_id":"n1","sequence":2,"type":"node_completed","wave":1,"node_id":"a"},{"event_id":"b1","sequence":3,"type":"metric_batch","wave":1,"metric_id":"m","batch":1,"failures":0,"total":100}]}'
+```
+
 ### `GET /health`
 
 ```json
@@ -1300,6 +1464,15 @@ pytest
   约束交互与逐波分区权重、16 节点上限精确求解；非正并发/全局/分区上限、
   非正权重、重复节点 ID、未知分区限额、空限额映射、空节点列表、17 节点、
   空串字段、额外/缺失字段 422，16 节点边界与未使用限额 200；
+- 铺开执行审计：按 sequence 乱序折叠、event_id 同内容去重、0 波即
+  completed、up_to_date 预置累计完成、各波护栏独立累计（批次号各自从 1
+  起）与 promote 闸门、全成功三批逐波 promote 至 completed、一波 hold 阻塞
+  下一波、多指标全 pass 才 promote、单指标冻结后再送批次、失败批 rollback
+  后任何事件（含越波启动）均违规、节点先于波启动/重复完成、指标早于全部
+  节点完成、批次跳号、重复启动、越波启动、首个违规即停且返回事前状态；
+  非 planned 计划、未知波次/节点/指标引用、节点串波、sequence 重复、
+  event_id 内容冲突、护栏 ID 重复/参数非法、波次号不连续、节点跨波重复、
+  计划计数不一致、事件形状错配（failures>total/多余字段）422；
 - API：健康检查、404、坏配置/环/未知依赖返回 422、同用户结果稳定、不同盐值产生分流、
   发布窗口求解往返与非 UTC 拒绝。
 
@@ -1319,8 +1492,9 @@ app/
   rebalance.py       # 权重重排：枚举目标顺序求全稳定桶最大布局（字典序破平局）、迁移矩阵与同向相邻区间合并
   retirement.py      # 开关下线方案：blocker 收集、终态依赖改写、候选分层删除（依赖方先于被依赖方）
   rollout.py         # 制品分波铺开：子集可行性剪枝枚举、最少波次 DP（下界短路）、字典序最小重建
+  rollout_audit.py   # 铺开执行审计：事件按 sequence 折叠重放、逐波独立复用 Wald SPRT、违规即停
   reconcile.py       # 决策日志核对：快照摘要允许区间、±偏差时间分类、评估器重算比对、节点计数
-  main.py            # FastAPI 路由 /validate /evaluate /explanations/minimize /guardrails/evaluate /approvals/evaluate /experiments/attribute /artifacts/sign /artifacts/verify /release-windows/resolve /rollouts/rebalance /flags/retirement-plan /sdk/rollout-plan /sdk/reconcile /health
+  main.py            # FastAPI 路由 /validate /evaluate /explanations/minimize /guardrails/evaluate /approvals/evaluate /experiments/attribute /artifacts/sign /artifacts/verify /release-windows/resolve /rollouts/rebalance /flags/retirement-plan /sdk/rollout-plan /sdk/rollout-audit /sdk/reconcile /health
 tests/               # pytest 套件
 examples/config.json
 Dockerfile

@@ -1,4 +1,4 @@
-"""FastAPI 应用：/validate 校验、/evaluate 评估、/explanations/minimize 最小充分上下文、/guardrails/evaluate 序贯护栏、/approvals/evaluate 多人审批、/experiments/attribute 实验归因、/artifacts 制品签发验签、/release-windows/resolve 发布窗口、/rollouts/rebalance 权重重排、/flags/retirement-plan 开关下线方案、/sdk/rollout-plan 制品分波铺开与 /sdk/reconcile 决策日志核对。"""
+"""FastAPI 应用：/validate 校验、/evaluate 评估、/explanations/minimize 最小充分上下文、/guardrails/evaluate 序贯护栏、/approvals/evaluate 多人审批、/experiments/attribute 实验归因、/artifacts 制品签发验签、/release-windows/resolve 发布窗口、/rollouts/rebalance 权重重排、/flags/retirement-plan 开关下线方案、/sdk/rollout-plan 制品分波铺开、/sdk/rollout-audit 铺开执行审计与 /sdk/reconcile 决策日志核对。"""
 
 from __future__ import annotations
 
@@ -31,6 +31,8 @@ from app.models import (
     ReleaseResolveResponse,
     RetirementPlanRequest,
     RetirementPlanResponse,
+    RolloutAuditRequest,
+    RolloutAuditResponse,
     RolloutPlanRequest,
     RolloutPlanResponse,
     SignRequest,
@@ -45,6 +47,7 @@ from app.reconcile import ReconcileRequestError, reconcile
 from app.release_windows import resolve_release_windows
 from app.retirement import RetirementRequestError, build_retirement_plan
 from app.rollout import build_rollout_plan
+from app.rollout_audit import audit_rollout
 from app.validation import validate_config
 
 app = FastAPI(
@@ -304,3 +307,17 @@ def sdk_rollout_plan(request: RolloutPlanRequest) -> RolloutPlanResponse:
     """
     # 重复节点 ID、未知分区限额、非正权重、非法上限等在模型校验阶段即 422。
     return build_rollout_plan(request)
+
+
+@app.post("/sdk/rollout-audit", response_model=RolloutAuditResponse)
+def sdk_rollout_audit(request: RolloutAuditRequest) -> RolloutAuditResponse:
+    """铺开执行审计：事件按 sequence 折叠重放，逐波独立复用序贯护栏。
+
+    wave_started 必须按波次顺序且上一波 promote；node_completed 只能发生
+    在所属波启动后；metric_batch 只能在该波全部节点完成后接收，各波护栏
+    独立累计。首个违规即停止：返回违规事件与事前状态；合法日志返回各波
+    完成节点、护栏路径与 running/completed/rollback_required 总状态。
+    """
+    # event_id 内容冲突、sequence 重复、事件引用未知波次/节点/指标、
+    # 非 planned 计划、护栏参数非法等在模型校验阶段即 422。
+    return audit_rollout(request)

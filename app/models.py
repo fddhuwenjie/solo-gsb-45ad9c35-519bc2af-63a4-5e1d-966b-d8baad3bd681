@@ -1472,3 +1472,302 @@ class RolloutPlanResponse(BaseModel):
     planned_node_count: int = Field(ge=0)
     waves: list[RolloutWave] = Field(default_factory=list)
     blockers: list[RolloutBlocker] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# SDK 分波铺开执行审计（事件序贯折叠 + 每波独立复用序贯护栏）
+# ---------------------------------------------------------------------------
+
+# 与 /guardrails/evaluate 一致：每波最多声明 8 个护栏指标。
+MAX_ROLLOUT_AUDIT_METRICS = 8
+
+
+class RolloutGuardrailSpec(BaseModel):
+    """每波独立复用的序贯护栏指标声明（参数同 GuardrailMetric，不含批次）。
+
+    各波的指标批次从空开始独立累计；metric_batch 事件按 wave 分别喂入，
+    判定路径由 /guardrails/evaluate 同一套 Wald SPRT 逻辑计算。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1)
+    baseline_rate: float = Field(gt=0, lt=1)
+    max_increase: float = Field(gt=0)
+    alpha: float = Field(gt=0, lt=1)
+    beta: float = Field(gt=0, lt=1)
+
+    @model_validator(mode="after")
+    def _check_rates(self) -> "RolloutGuardrailSpec":
+        if self.baseline_rate + self.max_increase >= 1:
+            raise ValueError("baseline_rate + max_increase 必须小于 1")
+        if self.alpha + self.beta >= 1:
+            raise ValueError("alpha + beta 必须小于 1")
+        return self
+
+
+class RolloutAuditEventType(str, enum.Enum):
+    """铺开执行事件类型：波启动、节点完成、指标批次。"""
+
+    WAVE_STARTED = "wave_started"
+    NODE_COMPLETED = "node_completed"
+    METRIC_BATCH = "metric_batch"
+
+
+class RolloutAuditEvent(BaseModel):
+    """一条执行审计事件，所有事件带唯一 event_id 与 sequence。
+
+    - wave_started：仅使用 wave（启动的波次号，1 起始）；
+    - node_completed：使用 wave 与 node_id（节点在所属波启动后才能完成）；
+    - metric_batch：使用 wave / metric_id / failures / total，
+      每波全部节点完成后才可接收，batch 为该波该指标的 1 起始递增批次号。
+    类型无关字段必须缺省，避免一条事件表达多个含义。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_id: str = Field(min_length=1)
+    sequence: int = Field(ge=0)
+    type: RolloutAuditEventType
+    wave: int | None = Field(default=None, ge=1)
+    node_id: str | None = None
+    metric_id: str | None = None
+    batch: int | None = Field(default=None, ge=1)
+    failures: int | None = Field(default=None, ge=0)
+    total: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> "RolloutAuditEvent":
+        if self.type == RolloutAuditEventType.WAVE_STARTED:
+            if self.wave is None:
+                raise ValueError("wave_started 事件必须给出 wave")
+            if self.node_id is not None or self.metric_id is not None:
+                raise ValueError("wave_started 事件不允许携带 node_id / metric_id")
+            if self.batch is not None or self.failures is not None or self.total is not None:
+                raise ValueError("wave_started 事件不允许携带批次字段")
+        elif self.type == RolloutAuditEventType.NODE_COMPLETED:
+            if self.wave is None or self.node_id is None or not self.node_id:
+                raise ValueError("node_completed 事件必须给出 wave 与非空 node_id")
+            if self.metric_id is not None:
+                raise ValueError("node_completed 事件不允许携带 metric_id")
+            if self.batch is not None or self.failures is not None or self.total is not None:
+                raise ValueError("node_completed 事件不允许携带批次字段")
+        else:
+            missing = [
+                name
+                for name, value in (
+                    ("wave", self.wave),
+                    ("metric_id", self.metric_id),
+                    ("batch", self.batch),
+                    ("failures", self.failures),
+                    ("total", self.total),
+                )
+                if value is None or name == "metric_id" and not value
+            ]
+            if missing:
+                raise ValueError(
+                    f"metric_batch 事件缺少字段: {', '.join(missing)}"
+                )
+            if self.node_id is not None:
+                raise ValueError("metric_batch 事件不允许携带 node_id")
+            if self.failures > self.total:  # type: ignore[operator]
+                raise ValueError("failures 不能大于 total")
+        return self
+
+
+class RolloutAuditRequest(BaseModel):
+    """POST /sdk/rollout-audit 请求：status=planned 原计划 + 护栏声明 + 事件流。
+
+    事件按 sequence 折叠重放（请求内可乱序提交）；同一 event_id 同内容
+    去重，内容冲突 → 422；sequence 不允许重复 → 422。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    plan: RolloutPlanResponse
+    guardrails: list[RolloutGuardrailSpec] = Field(
+        min_length=1, max_length=MAX_ROLLOUT_AUDIT_METRICS
+    )
+    events: list[RolloutAuditEvent] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "RolloutAuditRequest":
+        # 只接受 status=planned 的原计划：blocked 计划没有可执行波次。
+        if self.plan.status != RolloutStatus.PLANNED:
+            raise ValueError("只接受 status=planned 的原计划")
+        if self.plan.blockers:
+            raise ValueError("planned 计划不允许携带 blockers")
+
+        # 计划内部一致性：波次号从 1 连续，节点不跨波重复，
+        # planned_node_count 等于各波节点数。
+        wave_node_sets: list[set[str]] = []
+        for index, wave in enumerate(self.plan.waves, start=1):
+            if wave.wave != index:
+                raise ValueError(f"计划波次号必须从 1 连续：期望 {index}，实际 {wave.wave}")
+            ids = wave.node_ids
+            if len(ids) != len(set(ids)):
+                raise ValueError(f"第 {index} 波的 node_ids 存在重复")
+            wave_node_sets.append(set(ids))
+        all_planned = [node_id for wave_ids in wave_node_sets for node_id in wave_ids]
+        if len(all_planned) != len(set(all_planned)):
+            raise ValueError("同一节点不允许出现在多个波次")
+        if len(all_planned) != self.plan.planned_node_count:
+            raise ValueError(
+                "planned_node_count 与各波 node_ids 的节点总数不一致"
+            )
+        overlap = set(all_planned) & set(self.plan.up_to_date_nodes)
+        if overlap:
+            raise ValueError(
+                "已达目标节点不允许再出现在波次中: "
+                + ", ".join(sorted(overlap))
+            )
+
+        # 护栏指标 ID 唯一。
+        metric_ids: set[str] = set()
+        for spec in self.guardrails:
+            if spec.id in metric_ids:
+                raise ValueError(f"护栏指标 ID 重复: '{spec.id}'")
+            metric_ids.add(spec.id)
+
+        # 事件引用完整性（业务引用错误属于请求不合法，422）。
+        wave_count = len(self.plan.waves)
+        up_to_date = set(self.plan.up_to_date_nodes)
+        for event in self.events:
+            if event.wave is not None and not 1 <= event.wave <= wave_count:
+                raise ValueError(
+                    f"事件 '{event.event_id}' 引用了计划外波次: {event.wave}"
+                )
+            if event.type == RolloutAuditEventType.NODE_COMPLETED:
+                wave_ids = wave_node_sets[event.wave - 1]  # type: ignore[operator]
+                if event.node_id not in wave_ids:
+                    raise ValueError(
+                        f"事件 '{event.event_id}' 的节点 '{event.node_id}' "
+                        f"不属于第 {event.wave} 波"
+                    )
+            if event.type == RolloutAuditEventType.METRIC_BATCH:
+                if event.metric_id not in metric_ids:
+                    raise ValueError(
+                        f"事件 '{event.event_id}' 引用了未声明的护栏指标: "
+                        f"'{event.metric_id}'"
+                    )
+
+        # event_id 折叠键：同 ID 内容必须完全一致（含 sequence 与类型相关字段）。
+        seen: dict[str, tuple] = {}
+        for event in self.events:
+            content = (
+                event.sequence,
+                event.type,
+                event.wave,
+                event.node_id,
+                event.metric_id,
+                event.batch,
+                event.failures,
+                event.total,
+            )
+            previous = seen.get(event.event_id)
+            if previous is not None and previous != content:
+                raise ValueError(f"事件 ID 内容冲突: '{event.event_id}'")
+            seen[event.event_id] = content
+
+        # 去重后 sequence 必须唯一。
+        sequences = {event.sequence for event_id, event in self._deduped().items()}
+        if len(sequences) != len(seen):
+            raise ValueError("事件 sequence 不允许重复")
+        return self
+
+    def _deduped(self) -> dict[str, RolloutAuditEvent]:
+        """按 event_id 去重（保留首个）；调用时内容冲突已由校验拒绝。"""
+        unique: dict[str, RolloutAuditEvent] = {}
+        for event in self.events:
+            unique.setdefault(event.event_id, event)
+        return unique
+
+
+class RolloutAuditStatus(str, enum.Enum):
+    """铺开执行总状态。"""
+
+    RUNNING = "running"
+    COMPLETED = "completed"
+    ROLLBACK_REQUIRED = "rollback_required"
+
+
+class RolloutWaveStatus(str, enum.Enum):
+    """单个波次的执行阶段。"""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    AWAITING_METRICS = "awaiting_metrics"
+    PROMOTED = "promoted"
+    ROLLBACK_REQUIRED = "rollback_required"
+
+
+class RolloutViolationKind(str, enum.Enum):
+    """序贯执行违规类型（遇到首个即停止重放）。"""
+
+    EVENT_AFTER_ROLLBACK = "event_after_rollback"
+    WAVE_SKIPPED = "wave_skipped"
+    WAVE_ALREADY_STARTED = "wave_already_started"
+    NODE_BEFORE_WAVE_START = "node_before_wave_start"
+    NODE_ALREADY_COMPLETED = "node_already_completed"
+    METRICS_BEFORE_WAVE_START = "metrics_before_wave_start"
+    METRICS_BEFORE_NODES_COMPLETE = "metrics_before_nodes_complete"
+    METRIC_BATCH_GAP = "metric_batch_gap"
+    METRIC_FROZEN = "metric_frozen"
+    METRICS_AFTER_PROMOTE = "metrics_after_promote"
+
+
+class RolloutViolation(BaseModel):
+    """首个违规事件及其事前状态（违规事件不改变状态）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: RolloutViolationKind
+    message: str
+    event: RolloutAuditEvent
+
+
+class RolloutWaveAudit(BaseModel):
+    """单个波次的执行审计视图。
+
+    pending 阶段 metrics 为空；启动后给出各指标独立累计的判定与路径；
+    decision 为该波护栏总决策（running/未收批次时为 null）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    wave: int = Field(ge=1)
+    status: RolloutWaveStatus
+    started: bool = False
+    completed_node_ids: list[str] = Field(default_factory=list)
+    batch_count: int = Field(default=0, ge=0)
+    decision: OverallDecision | None = None
+    metrics: list[GuardrailMetricResult] = Field(default_factory=list)
+
+
+class RolloutAuditState(BaseModel):
+    """截至某一时点的铺开执行状态（违规时为事前状态快照）。
+
+    all_completed_node_ids 含计划中已完成节点与原计划 up_to_date_nodes。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: RolloutAuditStatus
+    current_wave: int | None = None
+    all_completed_node_ids: list[str] = Field(default_factory=list)
+    replayed_event_count: int = Field(default=0, ge=0)
+    waves: list[RolloutWaveAudit] = Field(default_factory=list)
+
+
+class RolloutAuditResponse(BaseModel):
+    """POST /sdk/rollout-audit 响应。
+
+    valid=false 时 violation 给出首个违规事件，state 为该事件处理前的
+    事前状态；valid=true 时 state 为折叠完全部合法事件后的状态。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    valid: bool
+    state: RolloutAuditState
+    violation: RolloutViolation | None = None
