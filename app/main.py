@@ -1,4 +1,4 @@
-"""FastAPI 应用：/validate 校验、/evaluate 评估、/explanations/minimize 最小充分上下文、/guardrails/evaluate 序贯护栏、/approvals/evaluate 多人审批、/experiments/attribute 实验归因、/artifacts 制品签发验签、/release-windows/resolve 发布窗口、/rollouts/rebalance 权重重排、/flags/retirement-plan 开关下线方案、/sdk/rollout-plan 制品分波铺开与 /sdk/reconcile 决策日志核对。"""
+"""FastAPI 应用：/validate 校验、/evaluate 评估、/explanations/minimize 最小充分上下文、/guardrails/evaluate 序贯护栏、/approvals/evaluate 多人审批、/experiments/attribute 实验归因、/artifacts 制品签发验签、/release-windows/resolve 发布窗口、/rollouts/rebalance 权重重排、/flags/retirement-plan 开关下线方案、/sdk/rollout-plan 制品分波铺开、/sdk/rollout-audit 铺开执行审计与 /sdk/reconcile 决策日志核对。"""
 
 from __future__ import annotations
 
@@ -31,6 +31,8 @@ from app.models import (
     ReleaseResolveResponse,
     RetirementPlanRequest,
     RetirementPlanResponse,
+    RolloutAuditRequest,
+    RolloutAuditResponse,
     RolloutPlanRequest,
     RolloutPlanResponse,
     SignRequest,
@@ -45,6 +47,7 @@ from app.reconcile import ReconcileRequestError, reconcile
 from app.release_windows import resolve_release_windows
 from app.retirement import RetirementRequestError, build_retirement_plan
 from app.rollout import build_rollout_plan
+from app.rollout_audit import RolloutAuditError, audit_rollout
 from app.validation import validate_config
 
 app = FastAPI(
@@ -55,7 +58,7 @@ app = FastAPI(
         "二项失败率序贯护栏（Wald SPRT）、"
         "配置制品签发/验签、多人审批判定、曝光-转化实验归因、"
         "多地区发布窗口求解、变体权重重排、已关闭开关的下线方案生成"
-        "与 SDK 节点决策日志核对。"
+        "与 SDK 节点决策日志核对及铺开执行审计。"
     ),
     version="1.0.0",
 )
@@ -304,3 +307,19 @@ def sdk_rollout_plan(request: RolloutPlanRequest) -> RolloutPlanResponse:
     """
     # 重复节点 ID、未知分区限额、非正权重、非法上限等在模型校验阶段即 422。
     return build_rollout_plan(request)
+
+
+@app.post("/sdk/rollout-audit", response_model=RolloutAuditResponse)
+def sdk_rollout_audit(request: RolloutAuditRequest) -> RolloutAuditResponse:
+    """铺开执行审计：按 sequence 折叠 wave_started/node_completed/metric_batch 事件流。
+
+    节点只能在所属波启动后完成；每波全部节点完成后才可接收指标，各波独立
+    复用序贯护栏累计；promote 后方可启动下一波，hold 越波或 rollback 后再
+    执行均违规。首个违规即停止，返回违规事件与事前状态；日志合法则返回
+    各波完成节点、护栏路径与 running/completed/rollback_required。
+    """
+    try:
+        return audit_rollout(request)
+    except RolloutAuditError as exc:
+        # 原计划非 planned 或结构被篡改（波次编号/完成列表不一致等）。
+        raise HTTPException(status_code=422, detail=str(exc)) from None

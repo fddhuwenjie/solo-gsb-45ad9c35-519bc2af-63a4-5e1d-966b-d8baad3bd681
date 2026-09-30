@@ -45,7 +45,14 @@
   `max_parallel`、全局与各 region 每波最大不可用流量权重及故障域
   （同一 `failure_domain` 每波至多一个节点）约束，用节点子集精确枚举
   求出**最少波次**，多解时每波 ID 升序后取波次序列**字典序最小**者；
-  任一节点单独更新仍超全局或其分区权重上限时返回 `blockers`，不出部分计划。
+  任一节点单独更新仍超全局或其分区权重上限时返回 `blockers`，不出部分计划；
+- **铺开执行审计**：对 `status=planned` 的原计划重放
+  `wave_started/node_completed/metric_batch` 事件流（可乱序，按
+  `sequence` 折叠、同 `event_id` 同内容去重、冲突 422）——节点只能在
+  所属波启动后完成，每波全部节点完成后才可接收指标，各波独立复用序贯
+  护栏逐批累计，`promote` 后方可启动下一波，`hold` 越波或 `rollback`
+  后再执行均违规；首个违规即停止并回显事件与事前状态，合法日志返回各波
+  完成节点、护栏路径与 `running/completed/rollback_required`。
 
 响应包含**最终变体、命中轨迹（trace）与失败原因（reason）**。
 
@@ -1219,6 +1226,197 @@ curl -s http://localhost:8000/sdk/rollout-plan \
   -d '{"target_digest":"new","max_parallel":2,"max_unavailable_weight":50,"region_max_unavailable_weight":{"r1":50},"nodes":[{"id":"a","current_digest":"old","region":"r1","failure_domain":"fd-a","traffic_weight":20},{"id":"b","current_digest":"old","region":"r1","failure_domain":"fd-b","traffic_weight":20}]}'
 ```
 
+### `POST /sdk/rollout-audit` — 铺开执行审计
+
+对一份 `status=planned` 的原计划，重放 SDK 节点上报的**执行事件流**，按序贯
+护栏门控逐波推进，校验执行是否合规。请求携带三部分：
+
+- `plan`：`/sdk/rollout-plan` 返回的原计划（必须 `status=planned`；
+  `blocked` 计划不可执行，波次编号/累计完成列表被篡改返回 `422`）；
+- `guardrails`：1～8 个序贯护栏指标声明（字段同 `/guardrails/evaluate` 的
+  指标，但不含 `batches`——批次随事件流逐批到达）；
+- `events`：`wave_started` / `node_completed` / `metric_batch` 事件，
+  每条带全局唯一的 `event_id` 与 `sequence`，**可乱序提交**。
+
+事件折叠规则：
+
+1. **按 `sequence` 折叠**：服务端按 `sequence` 升序重放（同一 `sequence`
+   至多一条事件，重复返回 `422`，序号无需连续）；
+2. 同一 `event_id` 重复上报时**内容必须完全一致**（幂等重投，只计一次），
+   内容冲突返回 `422`。
+
+执行门控（逐波状态机）：
+
+- 波必须**按顺序启动**：跳过波次、重复启动均违规；上一波护栏仍为 `hold`
+  时启动下一波（越波）违规；
+- 节点**只能在所属波启动之后**完成：引用计划外节点、重复完成、在他波活动
+  期间完成均违规；
+- 每波**全部节点完成之后**才可接收该波的 `metric_batch`（引用未声明指标、
+  波次不存在、波未启动/已放行同样违规）；
+- 各波**独立**复用序贯护栏累计（Wald SPRT，公式同 `/guardrails/evaluate`）：
+  指标首次越界即**冻结**，冻结后再喂批次违规；全部指标 `pass` 才 `promote`，
+  `promote` 后方可启动下一波；
+- 任一指标判 `rollback` 后该波进入 `rollback_required`，此后再执行任何事件
+  （启动/完成/批次）都按 `execution_after_rollback` 违规。
+
+**遇到首个违规即停止**：响应 `violation` 给出违规事件（原样回显）、违规码
+与处理该事件**之前**的状态快照（`before_state`），其后的事件不再处理；
+日志全部合法时 `violation` 为 `null`。
+
+请求体（两波各一个节点，护栏每波独立累计）：
+
+```json
+{
+  "plan": {
+    "target_digest": "new",
+    "status": "planned",
+    "up_to_date_nodes": [],
+    "planned_node_count": 2,
+    "waves": [
+      {"wave": 1, "node_ids": ["a"], "global_unavailable_weight": 1,
+       "region_unavailable_weight": {"r1": 1},
+       "completed_node_ids": ["a"], "completed_node_count": 1},
+      {"wave": 2, "node_ids": ["b"], "global_unavailable_weight": 1,
+       "region_unavailable_weight": {"r1": 1},
+       "completed_node_ids": ["a", "b"], "completed_node_count": 2}
+    ],
+    "blockers": []
+  },
+  "guardrails": [
+    {"id": "error_rate", "baseline_rate": 0.01, "max_increase": 0.01,
+     "alpha": 0.05, "beta": 0.1}
+  ],
+  "events": [
+    {"event_id": "s1", "sequence": 1, "type": "wave_started", "wave": 1},
+    {"event_id": "n1", "sequence": 2, "type": "node_completed", "node_id": "a"},
+    {"event_id": "m1-1", "sequence": 3, "type": "metric_batch",
+     "wave": 1, "metric_id": "error_rate", "failures": 0, "total": 100},
+    {"event_id": "m1-2", "sequence": 4, "type": "metric_batch",
+     "wave": 1, "metric_id": "error_rate", "failures": 0, "total": 100},
+    {"event_id": "m1-3", "sequence": 5, "type": "metric_batch",
+     "wave": 1, "metric_id": "error_rate", "failures": 0, "total": 100},
+    {"event_id": "s2", "sequence": 6, "type": "wave_started", "wave": 2},
+    {"event_id": "n2", "sequence": 7, "type": "node_completed", "node_id": "b"},
+    {"event_id": "m2-1", "sequence": 8, "type": "metric_batch",
+     "wave": 2, "metric_id": "error_rate", "failures": 0, "total": 100},
+    {"event_id": "m2-2", "sequence": 9, "type": "metric_batch",
+     "wave": 2, "metric_id": "error_rate", "failures": 0, "total": 100},
+    {"event_id": "m2-3", "sequence": 10, "type": "metric_batch",
+     "wave": 2, "metric_id": "error_rate", "failures": 0, "total": 100}
+  ]
+}
+```
+
+> 上例每波 3 批 `0/100` 全成功，累计 LLR 跌破下阈值 `ln(β/(1−α)) ≈ −2.25`，
+> 各波指标第 3 批判 `pass`，波次随即 `promote`。
+
+合法日志响应（`200`）：`status` 为 `running`（尚有波未启动/护栏仍 hold）、
+`completed`（全部波 promote）或 `rollback_required`（活动波护栏判 rollback）；
+顶层 `completed_node_ids` 只含**已 promote 波**的节点（与规划响应的逐波累计
+语义一致；已回报完成但所在波尚未 promote 的节点只出现在该波
+`waves[].completed_node_ids` 中）。`waves[]` 另给出当前护栏总判定与逐指标的
+**累计路径**（`metrics[].path`，字段同 `/guardrails/evaluate`，未启动波为空）：
+
+```json
+{
+  "target_digest": "new",
+  "status": "completed",
+  "current_wave": null,
+  "promoted_waves": [1, 2],
+  "completed_node_ids": ["a", "b"],
+  "waves": [
+    {
+      "wave": 1,
+      "started": true,
+      "completed_node_ids": ["a"],
+      "decision": "promote",
+      "metrics": [
+        {"id": "error_rate", "decision": "pass", "stop_batch": 3,
+         "failures": 0, "total": 300, "p0": 0.01, "p1": 0.02,
+         "lower_threshold": -2.2513, "upper_threshold": 2.8904,
+         "llr": -3.0457,
+         "path": [
+           {"batch": 1, "failures": 0, "total": 100, "llr": -1.0152},
+           {"batch": 2, "failures": 0, "total": 100, "llr": -2.0305},
+           {"batch": 3, "failures": 0, "total": 100, "llr": -3.0457}
+         ]}
+      ]
+    }
+  ],
+  "violation": null
+}
+```
+
+首个违规响应（仍为 `200`，业务违规而非请求格式错误）：`violation.event`
+原样回显违规事件，`violation.before_state` 为事前状态快照，顶层 `status` /
+`waves` 等与事前快照一致。例如下一波在护栏仍 `hold` 时被启动：
+
+```json
+{
+  "target_digest": "new",
+  "status": "running",
+  "current_wave": 1,
+  "promoted_waves": [],
+  "completed_node_ids": ["a"],
+  "waves": [ /* 事前快照：第 1 波 decision=hold，第 2 波未启动 */ ],
+  "violation": {
+    "code": "previous_wave_not_promoted",
+    "message": "上一波护栏尚未 promote（仍为 hold），不得越波启动后续波",
+    "event": {"event_id": "s2", "sequence": 6, "type": "wave_started", "wave": 2},
+    "before_state": { "status": "running", "current_wave": 1, "promoted_waves": [],
+                      "completed_node_ids": ["a"], "waves": [ /* … */ ] }
+  }
+}
+```
+
+违规码一览：
+
+| `code` | 触发条件 |
+| --- | --- |
+| `unknown_wave` | 事件引用计划中不存在的波次 |
+| `wave_already_started` | 该波已启动，`wave_started` 重复 |
+| `wave_skipped` | 存在更早的波未启动（跳波启动） |
+| `previous_wave_not_promoted` | 上一波护栏仍为 `hold`，却启动下一波 |
+| `wave_not_started` | 节点完成/指标批次所属波尚未启动（含 hold 期间抢跑后续波） |
+| `wave_already_promoted` | 对已 `promote` 的波再喂指标批次 |
+| `unknown_node` | 完成事件引用计划外节点 |
+| `node_not_in_wave` | 节点不属于当前活动波 |
+| `node_already_completed` | 节点（含请求时已达目标的节点）完成事件重复 |
+| `metrics_before_wave_complete` | 波内尚有节点未完成即接收指标 |
+| `unknown_metric` | 批次引用未在 `guardrails` 声明的指标 |
+| `metric_frozen` | 指标首次越界冻结后又收到批次 |
+| `execution_after_rollback` | 护栏判 `rollback` 后再执行任何事件 |
+
+请求校验（不满足时返回 `422`）：事件字段形状与 `type` 不符（如
+`wave_started` 携带 `node_id`、`metric_batch` 缺 `failures/total` 或
+`failures > total`）、同 `sequence` 重复、同 `event_id` 内容冲突、
+护栏指标 ID 重复/数量超出 1～8、护栏概率参数越界、计划非 `planned` 或
+波次/完成列表结构不自洽、请求与事件对象出现未声明字段。
+
+请求示例：
+
+```bash
+curl -s http://localhost:8000/sdk/rollout-audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "plan": {"target_digest":"new","status":"planned","up_to_date_nodes":[],
+             "planned_node_count":1,
+             "waves":[{"wave":1,"node_ids":["a"],"global_unavailable_weight":1,
+                       "region_unavailable_weight":{"r1":1},
+                       "completed_node_ids":["a"],"completed_node_count":1}],
+             "blockers":[]},
+    "guardrails": [{"id":"m","baseline_rate":0.01,"max_increase":0.01,
+                    "alpha":0.05,"beta":0.1}],
+    "events": [
+      {"event_id":"s1","sequence":1,"type":"wave_started","wave":1},
+      {"event_id":"n1","sequence":2,"type":"node_completed","node_id":"a"},
+      {"event_id":"b1","sequence":3,"type":"metric_batch","wave":1,
+       "metric_id":"m","failures":20,"total":100}
+    ]
+  }'
+# -> status="rollback_required"，第 1 批 LLR 越上阈值，护栏判 rollback
+```
+
 ### `GET /health`
 
 ```json
@@ -1300,6 +1498,18 @@ pytest
   约束交互与逐波分区权重、16 节点上限精确求解；非正并发/全局/分区上限、
   非正权重、重复节点 ID、未知分区限额、空限额映射、空节点列表、17 节点、
   空串字段、额外/缺失字段 422，16 节点边界与未使用限额 200；
+- 铺开执行审计：空日志 running、波启动建累计器、节点启动后完成、hold 不
+  推进、3 批全成功逐波 promote 到 completed、各波护栏独立累计（第二波
+  LLR 从 0 起算）、单批失败 rollback 冻结与 rollback_required、多指标全
+  pass 才 promote、指标按 ID 排序输出、已达目标节点预置完成且重放完成
+  事件违规、空计划无事件 completed；乱序按 sequence 折叠、同 event_id
+  同内容幂等/冲突 422、同 sequence 422、序号可不连续；节点波未启动完成、
+  未知/重复/他波节点、重复/跳波启动、hold 越波启动/完成/上报后续波、
+  未启动波收指标、全节点完成前收指标、未知指标/波次、指标 pass 冻结后再
+  喂、promote 后再喂旧波、rollback 后启动/完成/批次、首个违规即停止且
+  事后事件不落状态、违规事件原样回显与事前快照；blocked 计划、波次编号
+  与累计完成列表被篡改、事件字段形状不符、护栏 ID 重复/为空、额外字段
+  422；流式累计器与离线护栏结果逐字段一致、首次越界后冻结为空操作；
 - API：健康检查、404、坏配置/环/未知依赖返回 422、同用户结果稳定、不同盐值产生分流、
   发布窗口求解往返与非 UTC 拒绝。
 
@@ -1311,7 +1521,7 @@ app/
   validation.py      # 依赖图、引用、权重、环检测（迭代 DFS 三色标记，显式栈）
   evaluator.py       # 迭代依赖评估（显式帧栈 + 轨迹段树）、条件求值、SHA-256 分桶、权重选变体
   explanations.py    # 最小充分上下文：依赖闭包属性收集（迭代）、保留集合（属性数/字典序）枚举、域值与缺失态重评
-  guardrails.py      # Wald SPRT：逐批累计 LLR、阈值判定、冻结、总决策汇总
+  guardrails.py      # Wald SPRT：逐批累计 LLR、阈值判定、冻结、总决策汇总、流式累计器（审计复用）
   artifacts.py       # 规范化 JSON、SHA-256 摘要、HMAC-SHA256 签发/验签、密钥加载
   approvals.py       # 多人审批：事件折叠、否决判定、最大流分组配额、字典序最小分配
   attribution.py     # 实验归因：event_id 去重、最近曝光匹配、归因窗口、变体切换半开洗脱
@@ -1319,8 +1529,9 @@ app/
   rebalance.py       # 权重重排：枚举目标顺序求全稳定桶最大布局（字典序破平局）、迁移矩阵与同向相邻区间合并
   retirement.py      # 开关下线方案：blocker 收集、终态依赖改写、候选分层删除（依赖方先于被依赖方）
   rollout.py         # 制品分波铺开：子集可行性剪枝枚举、最少波次 DP（下界短路）、字典序最小重建
+  rollout_audit.py   # 铺开执行审计：事件按 sequence 折叠去重、波次门控状态机、逐波独立护栏累计、违规即停
   reconcile.py       # 决策日志核对：快照摘要允许区间、±偏差时间分类、评估器重算比对、节点计数
-  main.py            # FastAPI 路由 /validate /evaluate /explanations/minimize /guardrails/evaluate /approvals/evaluate /experiments/attribute /artifacts/sign /artifacts/verify /release-windows/resolve /rollouts/rebalance /flags/retirement-plan /sdk/rollout-plan /sdk/reconcile /health
+  main.py            # FastAPI 路由 /validate /evaluate /explanations/minimize /guardrails/evaluate /approvals/evaluate /experiments/attribute /artifacts/sign /artifacts/verify /release-windows/resolve /rollouts/rebalance /flags/retirement-plan /sdk/rollout-plan /sdk/rollout-audit /sdk/reconcile /health
 tests/               # pytest 套件
 examples/config.json
 Dockerfile
